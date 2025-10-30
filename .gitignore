@@ -1,0 +1,68 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+*.pyo
+*.pyd
+build/
+dist/
+wheels/
+*.egg-info
+*.egg
+.eggs/
+
+# Virtual environments
+.venv
+venv/
+env/
+ENV/
+
+# uv
+.python-version
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Data files
+data/
+*.csv
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Model checkpoints
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Outputs
+outputs/
+results/
+logs/
+wandb/
+*.png
+*.jpg
+*.pdf
+
+# macOS
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.log
+*.swp
+*.swo
+*~
