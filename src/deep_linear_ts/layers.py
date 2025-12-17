@@ -42,7 +42,8 @@ class MonarchLinearLayer(nn.Module):
         ])
 
         # Permutations (fixed, no learnable parameters)
-        self.register_buffer('permutations', self._compute_butterfly_permutations())
+        self.register_buffer(
+            'permutations', self._compute_butterfly_permutations())
 
     def _compute_butterfly_permutations(self) -> torch.Tensor:
         """Compute fixed butterfly permutation pattern."""
@@ -164,11 +165,11 @@ class ToeplitzLayer(nn.Module):
     def __init__(self, sequence_length: int, kernel_size: Optional[int] = None):
         super().__init__()
 
-        self.sequence_length = sequence_length
-        self.kernel_size = kernel_size or sequence_length
-
-        # Learnable kernel (defines the Toeplitz structure)
-        self.kernel = nn.Parameter(torch.randn(self.kernel_size) * 0.01)
+        self.sequence_length = int(sequence_length)
+        self.kernel_size = int(kernel_size or sequence_length)
+        self.kernel = nn.Parameter(torch.zeros(self.kernel_size))
+        # Kaiming-like scale for linear conv
+        nn.init.normal_(self.kernel, std=(2.0 / self.kernel_size) ** 0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -180,22 +181,19 @@ class ToeplitzLayer(nn.Module):
         Returns:
             Output tensor (batch, sequence, features)
         """
-        # Apply convolution along sequence dimension (Toeplitz structure)
-        # Rearrange to (batch, features, sequence) for conv1d
-        x = rearrange(x, 'b s f -> b f s')
+        # x: [B, S, F]
+        x = rearrange(x, 'b s f -> b f s')  # -> [B, F, S]
+        B, n_feats, S = x.shape
+        k = self.kernel.view(1, 1, -1).expand(n_feats, 1, -1)  # depthwise
 
-        # Pad to maintain sequence length
-        padding = self.kernel_size // 2
-        x = F.conv1d(x, self.kernel.view(1, 1, -1), padding=padding)
+        # STRICTLY CAUSAL: left pad only
+        pad_left = self.kernel_size - 1
+        x = F.pad(x, (pad_left, 0))  # pad on the left, no right padding
 
-        # Crop to original length if needed
-        if x.size(-1) > self.sequence_length:
-            x = x[..., :self.sequence_length]
-
-        # Rearrange back to (batch, sequence, features)
-        x = rearrange(x, 'b f s -> b s f')
-
-        return x
+        y = F.conv1d(x, k, padding=0, groups=n_feats)  # [B, n_feats, S]
+        # crop to original length if longer
+        y = y[..., :self.sequence_length]
+        return rearrange(y, 'b f s -> b s f')
 
 
 class FourierLayer(nn.Module):
@@ -217,8 +215,10 @@ class FourierLayer(nn.Module):
         self.modes = modes or dim // 2
 
         # Complex weights for Fourier modes (stored as real + imaginary)
-        self.weight_real = nn.Parameter(torch.randn(self.modes, dim, dim) * 0.01)
-        self.weight_imag = nn.Parameter(torch.randn(self.modes, dim, dim) * 0.01)
+        self.weight_real = nn.Parameter(
+            torch.randn(self.modes, dim, dim) * 0.01)
+        self.weight_imag = nn.Parameter(
+            torch.randn(self.modes, dim, dim) * 0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -242,10 +242,10 @@ class FourierLayer(nn.Module):
             imag = x_ft[:, i].imag
 
             out_real = torch.einsum('bf,fk->bk', real, self.weight_real[i]) - \
-                       torch.einsum('bf,fk->bk', imag, self.weight_imag[i])
+                torch.einsum('bf,fk->bk', imag, self.weight_imag[i])
 
             out_imag = torch.einsum('bf,fk->bk', real, self.weight_imag[i]) + \
-                       torch.einsum('bf,fk->bk', imag, self.weight_real[i])
+                torch.einsum('bf,fk->bk', imag, self.weight_real[i])
 
             out_ft[:, i] = torch.complex(out_real, out_imag)
 

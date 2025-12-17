@@ -7,12 +7,20 @@ Includes:
 - Visualization tools
 """
 
+import os
 import torch
 import torch.nn as nn
 import numpy as np
 from typing import Dict, List, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
+
+# Load environment variables from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, environment variables must be set manually
 
 
 class DynamicsAnalyzer:
@@ -299,7 +307,18 @@ def visualize_predictions(
         save_path: Path to save figure
     """
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Check if CPU is forced via environment variable
+        force_cpu = os.getenv('FORCE_CPU', '0') == '1'
+
+        if force_cpu:
+            device = torch.device('cpu')
+        # Prioritize: CUDA > MPS > CPU
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
 
     model = model.to(device)
     model.eval()

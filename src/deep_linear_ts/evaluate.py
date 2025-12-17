@@ -7,6 +7,7 @@ Includes:
 - Inference time benchmarking
 """
 
+import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -14,6 +15,13 @@ import numpy as np
 from typing import Dict, Optional
 from tqdm import tqdm
 import time
+
+# Load environment variables from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, environment variables must be set manually
 
 
 @torch.no_grad()
@@ -34,7 +42,18 @@ def evaluate_model(
         Dictionary of evaluation metrics
     """
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Check if CPU is forced via environment variable
+        force_cpu = os.getenv('FORCE_CPU', '0') == '1'
+
+        if force_cpu:
+            device = torch.device('cpu')
+        # Prioritize: CUDA > MPS > CPU
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
 
     model = model.to(device)
     model.eval()
@@ -66,11 +85,13 @@ def evaluate_model(
     mae = torch.mean(torch.abs(all_outputs - all_targets)).item()
     rmse = np.sqrt(mse)
 
-    # Mean Absolute Percentage Error (avoid division by zero)
+    # Symmetric Mean Absolute Percentage Error (sMAPE)
+    # More robust for data near zero than standard MAPE
+    # sMAPE = 200 * |y_true - y_pred| / (|y_true| + |y_pred| + epsilon)
     epsilon = 1e-8
-    mape = torch.mean(
-        torch.abs((all_targets - all_outputs) / (all_targets + epsilon))
-    ).item() * 100
+    numerator = torch.abs(all_targets - all_outputs)
+    denominator = torch.abs(all_targets) + torch.abs(all_outputs) + epsilon
+    mape = torch.mean(numerator / denominator).item() * 200  # sMAPE ranges 0-200%
 
     # R² score
     ss_res = torch.sum((all_targets - all_outputs) ** 2)
@@ -184,7 +205,13 @@ def evaluate_persistence_baseline(
         Dictionary of metrics
     """
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Prioritize: CUDA > MPS > CPU
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
 
     all_outputs = []
     all_targets = []
@@ -223,7 +250,13 @@ def evaluate_linear_regression_baseline(
         Dictionary of metrics
     """
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Prioritize: CUDA > MPS > CPU
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
 
     # Simple linear model: just one linear layer
     sample_input, sample_target = next(iter(test_loader))

@@ -47,6 +47,7 @@ def main():
         output_dim=7,
         depth=100,  # 100 layers!
         sequence_length=96,
+        prediction_length=24,  # Forecast 24 steps ahead
         temporal_mixing='toeplitz',  # or 'linear_attention', 'fourier'
         use_residual=True,
         residual_weight=0.1,

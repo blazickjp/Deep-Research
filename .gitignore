@@ -15,10 +15,18 @@ wheels/
 venv/
 env/
 ENV/
-
+artifacts*
+/docs
+/examples
 # uv
 .python-version
-
+*.pt
+# Environment variables
+.env
+.env.local
+# Keep .env.example tracked for reference
+*.csv
+*.tsv
 # PyCharm
 .idea/
 
