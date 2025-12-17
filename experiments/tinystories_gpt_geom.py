@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data import DataLoader
+
 from dataclasses import dataclass
 from rich.console import Console
 from rich.table import Table
@@ -17,9 +19,12 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 
 # Optional tokenizer (falls back to char-level if unavailable or --char_level)
 try:
-    from transformers import AutoTokenizer
-except Exception:
-    AutoTokenizer = None
+    import tiktoken
+    _tiktoken_available = True
+    print("Import Succeeded")
+except ImportError:
+    _tiktoken_available = False
+    print("Import Failed")
 
 try:
     from datasets import load_dataset
@@ -67,24 +72,33 @@ def slogdet_safe(M: torch.Tensor, eye_eps: torch.Tensor) -> torch.Tensor:
 
 
 def gram_logdet_BTCxC(x, lam, eps=1e-4, normalize=True):
-    # x: [B,T,C] or [N,C], Gram over C with samples = B*T or N
     if lam <= 0.0:
         return x.new_zeros(())
-    if x.dim() == 3:
-        B, T, C = x.shape
-        X = x.reshape(B*T, C).transpose(0, 1)        # [C, BT]
+
+    # keep gradients, but compute logdet in fp32
+    x32 = x.float()
+
+    if x32.dim() == 3:
+        B, T, C = x32.shape
+        X = x32.reshape(B*T, C).transpose(0, 1)   # [C, BT]
     else:
-        N, C = x.shape
-        X = x.transpose(0, 1)         # [C, N]
+        N, C = x32.shape
+        X = x32.transpose(0, 1)                   # [C, N]
+
     C = X.shape[0]
-    I = torch.eye(C, device=x.device, dtype=x.dtype)
-    G = (X @ X.t()) / float(X.shape[1]) + eps*I
-    lg = slogdet_safe(G, eps*I)
+    I = torch.eye(C, device=x.device, dtype=torch.float32)
+    G = (X @ X.t()) / float(X.shape[1]) + eps * I
+
+    lg = slogdet_safe(G, eps * I)  # now fp32-safe
+
     if normalize:
         tr = torch.trace(G)
-        return -lam * (lg - C * torch.log(tr + 1e-12))
+        val = -lam * (lg - C * torch.log(tr + 1e-12))
     else:
-        return -lam * lg
+        val = -lam * lg
+
+    # val is fp32 scalar; safe to return
+    return val
 
 
 class RunningSecondMoment:
@@ -223,39 +237,42 @@ class MultiHeadSelfAttention(nn.Module):
         self.d_model = cfg.d_model
         self.head_dim = cfg.d_model // cfg.n_head
         assert self.d_model % self.n_head == 0
-        self.Wq = nn.Linear(cfg.d_model, cfg.n_head*self.head_dim, bias=False)
-        self.Wk = nn.Linear(cfg.d_model, cfg.n_head*self.head_dim, bias=False)
-        self.Wv = nn.Linear(cfg.d_model, cfg.n_head*self.head_dim, bias=False)
-        self.Wo = nn.Linear(cfg.n_head*self.head_dim, cfg.d_model, bias=False)
+
+        self.Wq = nn.Linear(cfg.d_model, cfg.n_head *
+                            self.head_dim, bias=False)
+        self.Wk = nn.Linear(cfg.d_model, cfg.n_head *
+                            self.head_dim, bias=False)
+        self.Wv = nn.Linear(cfg.d_model, cfg.n_head *
+                            self.head_dim, bias=False)
+        self.Wo = nn.Linear(cfg.n_head * self.head_dim,
+                            cfg.d_model, bias=False)
         self.drop = nn.Dropout(cfg.dropout)
-        # Precompute a causal (lower-triangular) mask up to block_size
-        mask = torch.tril(torch.ones(cfg.block_size, cfg.block_size))
-        # Shape: [1, 1, T, T] so it can broadcast over batch and heads
-        self.register_buffer("causal_mask", mask.view(
-            1, 1, cfg.block_size, cfg.block_size), persistent=False)
 
     def forward(self, x, attn_mask=None, need_head_out=False):
-        B, T, C = x.shape
-        H = self.n_head
-        Dh = self.head_dim
-        q = self.Wq(x).view(B, T, H, Dh).transpose(1, 2)   # [B,H,T,Dh]
-        k = self.Wk(x).view(B, T, H, Dh).transpose(1, 2)   # [B,H,T,Dh]
-        v = self.Wv(x).view(B, T, H, Dh).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(Dh)  # [B,H,T,T]
-        # Apply causal mask (disallow attending to future positions)
-        cm = self.causal_mask[:, :, :T, :T]            # [1,1,T,T]
-        # use a very negative number in current dtype (safer than -inf on MPS/half)
-        att = att.masked_fill(cm == 0, torch.finfo(att.dtype).min)
-        # (optional) merge any provided mask too
-        if attn_mask is not None:
-            att = att + attn_mask
+        B, T, _ = x.shape
+        H, Dh = self.n_head, self.head_dim
 
-        w = F.softmax(att, dim=-1)
-        ctx = w @ v  # [B,H,T,Dh]
-        out = self.Wo(self.drop(ctx.transpose(
-            1, 2).contiguous().view(B, T, H*Dh)))
+        # Project and reshape to [B, H, T, Dh]
+        q = self.Wq(x).view(B, T, H, Dh).transpose(1, 2)
+        k = self.Wk(x).view(B, T, H, Dh).transpose(1, 2)
+        v = self.Wv(x).view(B, T, H, Dh).transpose(1, 2)
+
+        # PyTorch will choose Flash/mem-efficient kernels on CUDA when possible.
+        # Use causal=True for GPT-style autoregressive masking.
+        dropout_p = self.drop.p if self.training else 0.0
+
+        ctx = F.scaled_dot_product_attention(
+            q, k, v,
+            # should be broadcastable to [B,H,T,T] if provided
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=True
+        )  # [B, H, T, Dh]
+
+        out = self.Wo(ctx.transpose(1, 2).contiguous().view(B, T, H * Dh))
+
         if need_head_out:
-            return out, ctx.transpose(1, 2)  # [B,T,H,Dh]
+            return out, ctx.transpose(1, 2)  # [B, T, H, Dh]
         return out, None
 
 
@@ -326,14 +343,12 @@ class GPTSmall(nn.Module):
 
 
 def build_tokenizer(args):
-    if args.char_level or AutoTokenizer is None:
+    if args.char_level or not _tiktoken_available:
         return None
-    tok = AutoTokenizer.from_pretrained("gpt2")
-    tok.pad_token = tok.eos_token
-    return tok
+    return tiktoken.get_encoding("gpt2")  # Same vocab as GPT-2
 
 
-def prepare_dataset(args, tokenizer):
+def prepare_dataset(args, tokenizer, device):
     if tokenizer is None and load_dataset is None:
         raise RuntimeError(
             "datasets not available; use --char_level or install `datasets`")
@@ -356,10 +371,11 @@ def prepare_dataset(args, tokenizer):
         vocab_size = len(vocab)
         vocab_info = {'stoi': stoi, 'itos': itos, 'vocab': vocab}
     else:
-        def enc(s): return tokenizer.encode(s, add_special_tokens=False)
-        ids = [torch.tensor(enc(s), dtype=torch.long)
+        def enc(s): return tokenizer.encode(s)
+        eos_id = 50256
+        ids = [torch.tensor(enc(s) + [eos_id], dtype=torch.long)
                for s in text if len(s) > 0]
-        vocab_size = tokenizer.vocab_size
+        vocab_size = int(tokenizer.n_vocab)
         vocab_info = None
 
     stream = torch.cat([x for x in ids if len(x) > 0]) if len(
@@ -377,76 +393,70 @@ def prepare_dataset(args, tokenizer):
             def __getitem__(self, i):
                 seq = toks[i]
                 return seq[:-1], seq[1:]
-        return torch.utils.data.DataLoader(DS(), batch_size=args.batch, shuffle=True, num_workers=0)
+        return DataLoader(
+            DS(),
+            batch_size=args.batch,
+            shuffle=True,
+            num_workers=min(4, os.cpu_count() or 1),
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=True,
+        )
+
     return make_loader(train_stream), make_loader(val_stream), vocab_size, vocab_info
 
 
 @torch.no_grad()
 def generate_samples(model, tokenizer, vocab_info, device, epoch, out_dir, run_tag,
                      num_samples=3, max_length=200, temperature=0.8, top_k=50):
-    """Generate text samples after each epoch for qualitative evaluation."""
     model.eval()
+    eos_id = 50256  # GPT-2 endoftext (tiktoken)
 
-    # TinyStories-style prompts
-    prompts = [
-        "Once upon a time",
-        "One day, a little girl",
-        "There was a cat who"
-    ][:num_samples]
-
+    prompts = ["Once upon a time", "One day, a little girl",
+               "There was a cat who"][:num_samples]
     samples = []
+
     for prompt in prompts:
-        # Encode prompt
         if tokenizer is not None:
-            # BPE mode
-            tokens = tokenizer.encode(prompt, add_special_tokens=False)
+            tokens = tokenizer.encode(prompt)
             context = torch.tensor([tokens], dtype=torch.long, device=device)
         else:
-            # Character-level mode
-            stoi = vocab_info['stoi']
+            stoi = vocab_info["stoi"]
             tokens = [stoi.get(c, 0) for c in prompt]
             context = torch.tensor([tokens], dtype=torch.long, device=device)
 
-        # Autoregressive generation
         for _ in range(max_length):
-            # Get predictions (use last block_size tokens)
             context_crop = context[:, -model.cfg.block_size:]
-            logits, _, _, _, _ = model(context_crop)
-            logits = logits[:, -1, :] / temperature  # [1, V]
+            logits, _, _, _, _ = model(
+                context_crop, collect_layers=set(), collect_heads=False)
+            logits = logits[:, -1, :] / temperature
 
-            # Top-k sampling
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+                logits[logits < v[:, [-1]]] = -float("Inf")
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             context = torch.cat([context, next_token], dim=1)
 
-            # Stop at EOS for BPE tokenizer
-            if tokenizer is not None and next_token.item() == tokenizer.eos_token_id:
+            if tokenizer is not None and next_token.item() == eos_id:
                 break
 
-        # Decode
         if tokenizer is not None:
             text = tokenizer.decode(context[0].tolist())
         else:
-            itos = vocab_info['itos']
-            text = ''.join([itos.get(i, '?') for i in context[0].tolist()])
+            itos = vocab_info["itos"]
+            text = "".join([itos.get(i, "?") for i in context[0].tolist()])
 
         samples.append((prompt, text))
 
-    # Print to console with Rich formatting
     console.print(
         f"\n[bold cyan]═══ Generated Samples (Epoch {epoch}) ═══[/bold cyan]")
     for i, (prompt, text) in enumerate(samples, 1):
         console.print(f"\n[yellow]Sample {i}:[/yellow]")
-        # Truncate long outputs for console
         display_text = text[:500] + "..." if len(text) > 500 else text
         console.print(f"[dim]{display_text}[/dim]")
     console.print("[bold cyan]" + "="*50 + "[/bold cyan]\n")
 
-    # Save to file
     if out_dir:
         sample_file = os.path.join(
             out_dir, f"{run_tag}_samples_epoch{epoch}.txt")
@@ -454,9 +464,7 @@ def generate_samples(model, tokenizer, vocab_info, device, epoch, out_dir, run_t
             f.write(f"Generated Samples - Epoch {epoch}\n")
             f.write("="*70 + "\n\n")
             for i, (prompt, text) in enumerate(samples, 1):
-                f.write(f"Sample {i}:\n")
-                f.write(f"Prompt: {prompt}\n")
-                f.write(f"{text}\n\n")
+                f.write(f"Sample {i}:\nPrompt: {prompt}\n{text}\n\n")
                 f.write("-"*70 + "\n\n")
 
     model.train()
@@ -480,8 +488,17 @@ def run_validation(model, val_loader, device, cfg, ff_layers, head_layers, args)
 
         for i, (xb, yb) in enumerate(val_loader):
             xb, yb = xb.to(device), yb.to(device)
-            logits, ce, ffn_feats, head_feats, Hfinal = model(xb, yb,
-                                                              collect_layers=set(ff_layers+head_layers), collect_heads=True)
+            need_ff = args.ff_feat_lambda > 0
+            need_head = args.head_feat_lambda > 0
+            collect_layers = set(
+                ff_layers+head_layers) if (need_ff or need_head) else set()
+            collect_heads = need_head
+
+            logits, ce, ffn_feats, head_feats, Hfinal = model(
+                xb, yb,
+                collect_layers=collect_layers,
+                collect_heads=collect_heads
+            )
             val_loss += ce.item() * (xb.size(0)*(xb.size(1)-1))
             val_tok += xb.size(0)*(xb.size(1)-1)
 
@@ -572,18 +589,29 @@ def main():
     # Validation frequency
     ap.add_argument("--val_freq", type=int, default=5000,
                     help="Run validation every N steps (default: 5000)")
+    ap.add_argument("--amp", action="store_true")
 
     args = ap.parse_args()
     set_seed(args.seed)
 
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(False)
+
+    use_amp = args.amp and device.type == "cuda"
+    amp_dtype = torch.bfloat16
+
     os.makedirs(args.out_dir, exist_ok=True)
     run_tag = args.run_name if args.run_name else time.strftime(
         "%Y%m%d-%H%M%S")
 
     tokenizer = build_tokenizer(args)
     train_loader, val_loader, vocab_size, vocab_info = prepare_dataset(
-        args, tokenizer)
+        args, tokenizer, device)
 
     cfg = GPTConfig(vocab_size=vocab_size, block_size=args.block_size,
                     n_layer=args.n_layer, n_head=args.n_head,
@@ -648,6 +676,12 @@ def main():
 
     # Attach S_ema to model for validation function access
     model._S_ema = S_ema
+
+    need_ff = args.ff_feat_lambda > 0
+    need_head = args.head_feat_lambda > 0
+    collect_layers = set(
+        ff_layers + head_layers) if (need_ff or need_head) else set()
+    collect_heads = need_head
 
     # ==================== Pre-training Summary ====================
     console.print("\n[bold cyan]═══ TinyStories GPT Training ═══[/bold cyan]")
@@ -750,8 +784,9 @@ def main():
                 if batch_idx % args.grad_accum_steps == 0:
                     opt.zero_grad(set_to_none=True)
 
-                logits, ce, ffn_feats, head_feats, Hfinal = model(xb, yb,
-                                                                  collect_layers=set(ff_layers+head_layers), collect_heads=True)
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                    logits, ce, ffn_feats, head_feats, Hfinal = model(
+                        xb, yb, collect_layers=collect_layers, collect_heads=collect_heads)
 
                 # update Σ_h EMA *during training*
                 with torch.no_grad():
@@ -838,6 +873,21 @@ def main():
                             "lr": float(current_lr)
                         })
 
+                        # Generate text samples after each val_freq
+                        generate_samples(
+                            model=model,
+                            tokenizer=tokenizer,
+                            vocab_info=vocab_info,
+                            device=device,
+                            epoch=global_step,
+                            out_dir=args.out_dir,
+                            num_samples=3,
+                            run_tag=run_tag,
+                            max_length=200,
+                            temperature=0.8,
+                            top_k=50
+                        )
+
                         # Write to CSV if enabled
                         if args.save_csv:
                             with open(csv_step_path, "a") as f:
@@ -898,6 +948,16 @@ def main():
         final_train_ppl=metrics["epochs"][-1]["train_ppl"],
         device=str(device)
     )
+    ckpt_path = os.path.join(args.out_dir, f"{run_tag}_ep{ep}.pt")
+    torch.save({
+        "model": model.state_dict(),
+        "cfg": cfg.__dict__,
+        "args": vars(args),
+        "epoch": ep,
+        "global_step": global_step,
+    }, ckpt_path)
+    console.print(f"[green]Saved checkpoint: {ckpt_path}[/green]")
+
     if args.save_json:
         json_path = os.path.join(args.out_dir, f"{run_tag}.json")
         with open(json_path, "w") as f:
